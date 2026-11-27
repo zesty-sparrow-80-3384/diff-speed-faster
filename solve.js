@@ -107,16 +107,23 @@ function vsGrow(need) {
 function myersRuns(A, B, N, M) {
   const total = N + M;
   let D = -1;
+  // Local alias: the rows are read and written once per diagonal, so the
+  // buffer lives in a local through the search (it is refreshed after any
+  // growth, which only ever happens at a row start).
+  let vs = vsBuf;
 
   for (let d = 0; d <= total; d++) {
     const off = d * d;
     const end = off + 2 * d + 1;
-    if (end > vsCap) vsGrow(end);
+    if (end > vsCap) {
+      vsGrow(end);
+      vs = vsBuf;
+    }
     if (d === 0) {
       const xMax = N < M ? N : M;
       let x = 0;
       while (x < xMax && A[x] === B[x]) x++;
-      vsBuf[0] = x;
+      vs[0] = x;
       if (x === N && x === M) {
         D = 0;
         break;
@@ -124,16 +131,28 @@ function myersRuns(A, B, N, M) {
       continue;
     }
     const prevOff = (d - 1) * (d - 1);
-    const prevLen = 2 * d - 1;
     let done = false;
     // One prev-row read per diagonal: the deletion candidate at index ki-2
     // is the insertion candidate the previous step already read, so it is
     // carried in pvPrev instead of loaded again.
     let pvPrev = NONE;
-    let mk = M - d; // M + k, carried along the loop
-    for (let ki = 0, k = -d; k <= d; ki += 2, k += 2, mk += 2) {
+    // The search can only finish on diagonal k = N - M, so only that
+    // diagonal is ever tested for the end. kB is the first diagonal of
+    // this row at or past it (row diagonals step by 2 from -d): before
+    // kB the furthest y is M + k < N, past it M + k >= N, so the snake
+    // cap is M + k in the first stretch and N in the second — no min
+    // per diagonal. The last diagonal (k = d, ki = 2d) reads past the
+    // previous row, so it is handled on its own after both stretches.
+    const kEnd = N - M;
+    let kB = kEnd;
+    if (((kB + d) & 1) !== 0) kB++;
+    if (kB < -d) kB = -d;
+    const kAEnd = kB - 2;
+    let mk = M - d; // M + k, carried along the first stretch
+    const kLast = kAEnd < d - 2 ? kAEnd : d - 2;
+    for (let ki = 0, k = -d; k <= kLast; ki += 2, k += 2, mk += 2) {
       const pvDel = pvPrev;
-      const pvIns = ki < prevLen ? vsBuf[prevOff + ki] : NONE;
+      const pvIns = vs[prevOff + ki];
       pvPrev = pvIns;
       // Further into the old text wins; the deletion wins a tie. An
       // impossible candidate reads -1, below every real position, so the
@@ -142,16 +161,45 @@ function myersRuns(A, B, N, M) {
       const xIns = pvIns - (k + 1) < M ? pvIns : -1;
       const xPre = xDel >= xIns ? xDel : xIns;
       if (xPre < 0) {
-        vsBuf[off + ki] = NONE;
+        vs[off + ki] = NONE;
         continue;
       }
-      const xMax = N < mk ? N : mk;
       let x = xPre;
-      while (x < xMax && A[x] === B[x - k]) x++;
-      vsBuf[off + ki] = x;
-      if (x === N && x - k === M) {
+      while (x < mk && A[x] === B[x - k]) x++;
+      vs[off + ki] = x;
+    }
+    for (let ki = kB + d, k = kB; k <= d - 2; ki += 2, k += 2) {
+      const pvDel = pvPrev;
+      const pvIns = vs[prevOff + ki];
+      pvPrev = pvIns;
+      const xDel = pvDel < N ? pvDel + 1 : -1;
+      const xIns = pvIns - (k + 1) < M ? pvIns : -1;
+      const xPre = xDel >= xIns ? xDel : xIns;
+      if (xPre < 0) {
+        vs[off + ki] = NONE;
+        continue;
+      }
+      let x = xPre;
+      while (x < N && A[x] === B[x - k]) x++;
+      vs[off + ki] = x;
+      if (k === kEnd && x === N) {
         done = true;
         break;
+      }
+    }
+    if (!done) {
+      // Last diagonal k = d: the insertion candidate is past the previous
+      // row, so it is impossible; only the deletion candidate can reach.
+      const pvDel = pvPrev;
+      const xDel = pvDel < N ? pvDel + 1 : -1;
+      if (xDel >= 0) {
+        let x = xDel;
+        const xMax = d >= kEnd ? N : M + d;
+        while (x < xMax && A[x] === B[x - d]) x++;
+        vs[off + 2 * d] = x;
+        if (d === kEnd && x === N) done = true;
+      } else {
+        vs[off + 2 * d] = NONE;
       }
     }
     if (done) {
@@ -174,8 +222,8 @@ function myersRuns(A, B, N, M) {
     const prevLen = 2 * d - 1;
     const iDel = k + d - 2;
     const iIns = k + d;
-    const pvDel = iDel >= 0 ? vsBuf[prevOff + iDel] : NONE;
-    const pvIns = iIns < prevLen ? vsBuf[prevOff + iIns] : NONE;
+    const pvDel = iDel >= 0 ? vs[prevOff + iDel] : NONE;
+    const pvIns = iIns < prevLen ? vs[prevOff + iIns] : NONE;
     const canDel = pvDel < N;
     const canIns = pvIns - (k + 1) < M;
     const xDel = canDel ? pvDel + 1 : -1;
