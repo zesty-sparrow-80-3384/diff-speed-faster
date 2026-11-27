@@ -15,16 +15,26 @@
 //
 // Nothing here is copied from the baseline or from any other diff
 // implementation. The search below keeps, for each edit count, only the
-// furthest point each diagonal reaches — one Int32Array per edit count —
-// and rebuilds the script by walking those points backwards. That is the
-// whole speed trick: no object is built per diagonal step, line equality
-// is one integer comparison (lines are interned to ids first, keyed by the
-// split parts themselves so no line string is ever built twice), and the
-// patch is assembled from runs, not from per-line objects.
+// furthest point each diagonal reaches — all rows in one flat Int32Array
+// that is reused across calls, so the timed runs pay no allocation — and
+// rebuilds the script by walking those points backwards. That is the
+// whole speed trick: no object is built per diagonal step, the previous
+// step's insertion candidate is carried forward instead of loaded again,
+// line equality is one integer comparison (lines are interned to ids
+// first, keyed by the split parts themselves so no line string is ever
+// built twice), and the patch is assembled from runs, not from per-line
+// objects.
 
 const KEEP = 0;
 const DEL = 1;
 const INS = 2;
+
+// "No path here": stored in the V rows instead of -1, so the reachability
+// checks below need only one comparison each — a real position is always
+// below N (for a deletion) or below M + k + 1 (for an insertion), while the
+// sentinel sits above both. The xDel/xIns values compared for the max keep
+// using -1, below every real position.
+const NONE = 0x40000000;
 
 /** One run of the edit script: [kind, count]. Merges with the previous run when the kind matches. */
 function pushRun(runs, kind, count) {
@@ -69,6 +79,24 @@ function tokenize(text, table) {
   return { ids, parts, count };
 }
 
+// The Myers V rows live in one flat scratch buffer, reused across calls:
+// row d starts at offset d*d (it holds 2d+1 entries, so rows occupy
+// [d*d, (d+1)*(d+1))). The buffer grows by doubling when a deeper search
+// needs more room, and it is never shrunk, so after warmup the timed runs
+// pay no allocation at all. Every entry of every row is written before it
+// is read, so stale data from an earlier call is never seen.
+let vsBuf = new Int32Array(0);
+let vsCap = 0;
+
+function vsGrow(need) {
+  let cap = vsCap === 0 ? 1024 : vsCap;
+  while (cap < need) cap *= 2;
+  const next = new Int32Array(cap);
+  if (vsCap > 0) next.set(vsBuf.subarray(0, vsCap));
+  vsBuf = next;
+  vsCap = cap;
+}
+
 /**
  * The edit script's runs for the middle slices A (N lines) into B (M lines),
  * in order. The forward search stores, for each edit count d, the furthest
@@ -78,54 +106,54 @@ function tokenize(text, table) {
  */
 function myersRuns(A, B, N, M) {
   const total = N + M;
-  const Vs = new Array(total + 1);
   let D = -1;
 
   for (let d = 0; d <= total; d++) {
-    const cur = new Int32Array(2 * d + 1);
+    const off = d * d;
+    const end = off + 2 * d + 1;
+    if (end > vsCap) vsGrow(end);
     if (d === 0) {
       const xMax = N < M ? N : M;
       let x = 0;
       while (x < xMax && A[x] === B[x]) x++;
-      cur[0] = x;
-      Vs[0] = cur;
+      vsBuf[0] = x;
       if (x === N && x === M) {
         D = 0;
         break;
       }
       continue;
     }
-    const prev = Vs[d - 1];
-    const prevLen = prev.length;
+    const prevOff = (d - 1) * (d - 1);
+    const prevLen = 2 * d - 1;
     let done = false;
-    for (let k = -d; k <= d; k += 2) {
-      const iDel = k + d - 2;
-      const iIns = k + d;
-      const pvDel = iDel >= 0 ? prev[iDel] : -1;
-      const pvIns = iIns < prevLen ? prev[iIns] : -1;
-      // A deletion needs an old line left to delete; an insertion needs a new line left to insert.
-      const canDel = pvDel >= 0 && pvDel < N;
-      const canIns = pvIns >= 0 && pvIns - (k + 1) < M;
-      if (!canDel && !canIns) {
-        cur[k + d] = -1;
-        continue;
-      }
+    // One prev-row read per diagonal: the deletion candidate at index ki-2
+    // is the insertion candidate the previous step already read, so it is
+    // carried in pvPrev instead of loaded again.
+    let pvPrev = NONE;
+    let mk = M - d; // M + k, carried along the loop
+    for (let ki = 0, k = -d; k <= d; ki += 2, k += 2, mk += 2) {
+      const pvDel = pvPrev;
+      const pvIns = ki < prevLen ? vsBuf[prevOff + ki] : NONE;
+      pvPrev = pvIns;
       // Further into the old text wins; the deletion wins a tie. An
       // impossible candidate reads -1, below every real position, so the
       // plain comparison picks the possible one.
-      const xDel = canDel ? pvDel + 1 : -1;
-      const xIns = canIns ? pvIns : -1;
+      const xDel = pvDel < N ? pvDel + 1 : -1;
+      const xIns = pvIns - (k + 1) < M ? pvIns : -1;
       const xPre = xDel >= xIns ? xDel : xIns;
-      const xMax = N < M + k ? N : M + k;
+      if (xPre < 0) {
+        vsBuf[off + ki] = NONE;
+        continue;
+      }
+      const xMax = N < mk ? N : mk;
       let x = xPre;
       while (x < xMax && A[x] === B[x - k]) x++;
-      cur[k + d] = x;
+      vsBuf[off + ki] = x;
       if (x === N && x - k === M) {
         done = true;
         break;
       }
     }
-    Vs[d] = cur;
     if (done) {
       D = d;
       break;
@@ -142,14 +170,14 @@ function myersRuns(A, B, N, M) {
   let y = M;
   for (let d = D; d >= 1; d--) {
     const k = x - y;
-    const prev = Vs[d - 1];
-    const prevLen = prev.length;
+    const prevOff = (d - 1) * (d - 1);
+    const prevLen = 2 * d - 1;
     const iDel = k + d - 2;
     const iIns = k + d;
-    const pvDel = iDel >= 0 ? prev[iDel] : -1;
-    const pvIns = iIns < prevLen ? prev[iIns] : -1;
-    const canDel = pvDel >= 0 && pvDel < N;
-    const canIns = pvIns >= 0 && pvIns - (k + 1) < M;
+    const pvDel = iDel >= 0 ? vsBuf[prevOff + iDel] : NONE;
+    const pvIns = iIns < prevLen ? vsBuf[prevOff + iIns] : NONE;
+    const canDel = pvDel < N;
+    const canIns = pvIns - (k + 1) < M;
     const xDel = canDel ? pvDel + 1 : -1;
     const xIns = canIns ? pvIns : -1;
     const isDel = xDel >= xIns;
